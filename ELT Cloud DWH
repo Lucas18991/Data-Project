@@ -1,0 +1,534 @@
+-- =============================================================================
+-- DATA WAREHOUSE INTEGRATION - COMPLETE ETL PIPELINE
+-- Optimized for Cloud Data Warehouses (Synapse) and Medallion Architecture
+-- =============================================================================
+
+-- =============================================================================
+-- 1. STAGING LAYER (BRONZE) - Raw Data Ingestion
+-- =============================================================================
+
+-- Create staging schema for raw data
+CREATE SCHEMA IF NOT EXISTS staging;
+CREATE SCHEMA IF NOT EXISTS bronze;
+CREATE SCHEMA IF NOT EXISTS silver;
+CREATE SCHEMA IF NOT EXISTS gold;
+
+-- External data source configuration (for cloud integration)
+-- Azure Synapse / SQL DW specific
+CREATE EXTERNAL DATA SOURCE staging_blob_storage
+WITH (
+    TYPE = HADOOP,
+    LOCATION = 'wasbs://data@yourstorageaccount.blob.core.windows.net/',
+    CREDENTIAL = AzureStorageCredential
+);
+
+-- External file format for different source types
+CREATE EXTERNAL FILE FORMAT csv_format
+WITH (
+    FORMAT_TYPE = DELIMITEDTEXT,
+    FORMAT_OPTIONS (
+        FIELD_TERMINATOR = ',',
+        STRING_DELIMITER = '"',
+        FIRST_ROW = 2,
+        USE_TYPE_DEFAULT = FALSE
+    )
+);
+
+-- Staging table for raw customer data (optimized for bulk loads)
+CREATE TABLE staging.customers_raw (
+    customer_id BIGINT,
+    first_name NVARCHAR(100),
+    last_name NVARCHAR(100),
+    email NVARCHAR(255),
+    phone NVARCHAR(50),
+    address_line1 NVARCHAR(255),
+    address_line2 NVARCHAR(255),
+    city NVARCHAR(100),
+    state NVARCHAR(50),
+    postal_code NVARCHAR(20),
+    country NVARCHAR(50),
+    registration_date DATETIME2,
+    last_login_date DATETIME2,
+    customer_status NVARCHAR(20),
+    -- Audit columns
+    source_system NVARCHAR(50),
+    load_timestamp DATETIME2 DEFAULT GETUTCDATE(),
+    batch_id BIGINT
+)
+WITH (
+    CLUSTERED COLUMNSTORE INDEX,
+    DISTRIBUTION = ROUND_ROBIN -- For Synapse
+);
+
+-- Staging table for transactions
+CREATE TABLE staging.transactions_raw (
+    transaction_id BIGINT,
+    customer_id BIGINT,
+    product_id BIGINT,
+    transaction_date DATETIME2,
+    amount DECIMAL(18,2),
+    quantity INT,
+    discount_amount DECIMAL(18,2),
+    tax_amount DECIMAL(18,2),
+    payment_method NVARCHAR(50),
+    transaction_status NVARCHAR(20),
+    sales_rep_id BIGINT,
+    store_id BIGINT,
+    -- Audit columns
+    source_system NVARCHAR(50),
+    load_timestamp DATETIME2 DEFAULT GETUTCDATE(),
+    batch_id BIGINT
+)
+WITH (
+    CLUSTERED COLUMNSTORE INDEX,
+    DISTRIBUTION = HASH(customer_id) -- Distribute by customer for joins
+);
+
+-- Staging table for products
+CREATE TABLE staging.products_raw (
+    product_id BIGINT,
+    product_name NVARCHAR(255),
+    category NVARCHAR(100),
+    subcategory NVARCHAR(100),
+    brand NVARCHAR(100),
+    unit_price DECIMAL(18,2),
+    cost DECIMAL(18,2),
+    supplier_id BIGINT,
+    weight DECIMAL(10,3),
+    dimensions NVARCHAR(100),
+    is_active BIT,
+    created_date DATETIME2,
+    modified_date DATETIME2,
+    -- Audit columns
+    source_system NVARCHAR(50),
+    load_timestamp DATETIME2 DEFAULT GETUTCDATE(),
+    batch_id BIGINT
+)
+WITH (
+    CLUSTERED COLUMNSTORE INDEX,
+    DISTRIBUTION = REPLICATE -- Small dimension table, replicate
+);
+
+-- =============================================================================
+-- 2. BRONZE TO SILVER TRANSFORMATION (Data Cleansing & Validation)
+-- =============================================================================
+
+-- Create cleansed customer dimension
+CREATE OR REPLACE PROCEDURE silver.usp_load_customer_dimension
+    @batch_id BIGINT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    -- Truncate and reload pattern for full refresh
+    TRUNCATE TABLE silver.dim_customer;
+    
+    INSERT INTO silver.dim_customer (
+        customer_key,
+        customer_id,
+        customer_name,
+        email,
+        phone,
+        full_address,
+        city,
+        state,
+        postal_code,
+        country,
+        registration_date,
+        last_login_date,
+        customer_status,
+        customer_tier,
+        is_active,
+        -- SCD Type 2 columns
+        effective_from_date,
+        effective_to_date,
+        is_current,
+        -- Audit columns
+        created_date,
+        modified_date,
+        source_system
+    )
+    SELECT 
+        ROW_NUMBER() OVER (ORDER BY customer_id) as customer_key,
+        customer_id,
+        TRIM(CONCAT(COALESCE(first_name, ''), ' ', COALESCE(last_name, ''))) as customer_name,
+        LOWER(TRIM(email)) as email,
+        -- Clean phone number
+        CASE 
+            WHEN LEN(REPLACE(REPLACE(REPLACE(phone, '(', ''), ')', ''), '-', '')) = 10
+            THEN REPLACE(REPLACE(REPLACE(phone, '(', ''), ')', ''), '-', '')
+            ELSE NULL
+        END as phone,
+        CONCAT_WS(', ', 
+            NULLIF(TRIM(address_line1), ''),
+            NULLIF(TRIM(address_line2), '')
+        ) as full_address,
+        TRIM(city) as city,
+        TRIM(state) as state,
+        TRIM(postal_code) as postal_code,
+        TRIM(country) as country,
+        registration_date,
+        last_login_date,
+        UPPER(TRIM(customer_status)) as customer_status,
+        -- Calculate customer tier based on business rules
+        CASE 
+            WHEN DATEDIFF(day, last_login_date, GETUTCDATE()) <= 30 THEN 'PREMIUM'
+            WHEN DATEDIFF(day, last_login_date, GETUTCDATE()) <= 90 THEN 'STANDARD'
+            ELSE 'INACTIVE'
+        END as customer_tier,
+        CASE WHEN customer_status = 'ACTIVE' THEN 1 ELSE 0 END as is_active,
+        -- SCD Type 2
+        GETUTCDATE() as effective_from_date,
+        '9999-12-31' as effective_to_date,
+        1 as is_current,
+        -- Audit
+        GETUTCDATE() as created_date,
+        GETUTCDATE() as modified_date,
+        source_system
+    FROM staging.customers_raw
+    WHERE batch_id = @batch_id
+        AND customer_id IS NOT NULL
+        AND email IS NOT NULL
+        AND email LIKE '%@%'  -- Basic email validation
+    ;
+END;
+
+-- Create cleansed product dimension
+CREATE TABLE silver.dim_product (
+    product_key BIGINT IDENTITY(1,1) PRIMARY KEY,
+    product_id BIGINT NOT NULL,
+    product_name NVARCHAR(255),
+    category NVARCHAR(100),
+    subcategory NVARCHAR(100),
+    brand NVARCHAR(100),
+    unit_price DECIMAL(18,2),
+    cost DECIMAL(18,2),
+    margin_percent AS ((unit_price - cost) / NULLIF(unit_price, 0) * 100),
+    supplier_id BIGINT,
+    weight DECIMAL(10,3),
+    dimensions NVARCHAR(100),
+    is_active BIT,
+    -- SCD Type 2 columns
+    effective_from_date DATETIME2,
+    effective_to_date DATETIME2,
+    is_current BIT,
+    -- Audit columns
+    created_date DATETIME2,
+    modified_date DATETIME2,
+    source_system NVARCHAR(50)
+)
+WITH (
+    CLUSTERED COLUMNSTORE INDEX,
+    DISTRIBUTION = REPLICATE
+);
+
+-- Create fact table for transactions
+CREATE TABLE silver.fact_transaction (
+    transaction_key BIGINT IDENTITY(1,1),
+    transaction_id BIGINT NOT NULL,
+    customer_key BIGINT,
+    product_key BIGINT,
+    date_key INT, -- Reference to date dimension
+    transaction_date DATETIME2,
+    amount DECIMAL(18,2),
+    quantity INT,
+    discount_amount DECIMAL(18,2),
+    tax_amount DECIMAL(18,2),
+    net_amount AS (amount - discount_amount + tax_amount),
+    payment_method NVARCHAR(50),
+    transaction_status NVARCHAR(20),
+    sales_rep_id BIGINT,
+    store_id BIGINT,
+    -- Audit columns
+    created_date DATETIME2 DEFAULT GETUTCDATE(),
+    source_system NVARCHAR(50)
+)
+WITH (
+    CLUSTERED COLUMNSTORE INDEX,
+    DISTRIBUTION = HASH(customer_key)
+);
+
+-- =============================================================================
+-- 3. SILVER TO GOLD TRANSFORMATION (Business Logic & Aggregations)
+-- =============================================================================
+
+-- Customer analytics aggregation
+CREATE TABLE gold.customer_analytics (
+    customer_key BIGINT,
+    customer_id BIGINT,
+    customer_name NVARCHAR(255),
+    -- Lifetime metrics
+    total_transactions INT,
+    total_spend DECIMAL(18,2),
+    avg_transaction_value DECIMAL(18,2),
+    first_transaction_date DATETIME2,
+    last_transaction_date DATETIME2,
+    days_since_last_transaction INT,
+    -- Behavioral metrics
+    favorite_category NVARCHAR(100),
+    favorite_payment_method NVARCHAR(50),
+    avg_monthly_spend DECIMAL(18,2),
+    transaction_frequency_days DECIMAL(10,2),
+    -- Customer segmentation
+    customer_segment NVARCHAR(50),
+    lifetime_value_tier NVARCHAR(20),
+    churn_risk_score DECIMAL(5,2),
+    -- Time period metrics (last 12 months)
+    ytd_spend DECIMAL(18,2),
+    ytd_transactions INT,
+    -- Audit
+    last_updated DATETIME2 DEFAULT GETUTCDATE()
+)
+WITH (
+    CLUSTERED COLUMNSTORE INDEX,
+    DISTRIBUTION = HASH(customer_key)
+);
+
+-- Monthly sales summary for BI dashboards
+CREATE TABLE gold.monthly_sales_summary (
+    year_month INT, -- YYYYMM format
+    year_num INT,
+    month_num INT,
+    month_name NVARCHAR(20),
+    -- Sales metrics
+    total_revenue DECIMAL(18,2),
+    total_transactions INT,
+    unique_customers INT,
+    avg_transaction_value DECIMAL(18,2),
+    total_quantity_sold BIGINT,
+    -- Growth metrics
+    revenue_growth_pct DECIMAL(5,2),
+    transaction_growth_pct DECIMAL(5,2),
+    customer_growth_pct DECIMAL(5,2),
+    -- Top performers
+    top_category NVARCHAR(100),
+    top_product NVARCHAR(255),
+    -- Audit
+    last_updated DATETIME2 DEFAULT GETUTCDATE()
+)
+WITH (
+    CLUSTERED COLUMNSTORE INDEX,
+    DISTRIBUTION = REPLICATE
+);
+
+-- =============================================================================
+-- 4. PERFORMANCE OPTIMIZATION PROCEDURES
+-- =============================================================================
+
+-- Bulk load procedure with optimal performance settings
+CREATE OR REPLACE PROCEDURE staging.usp_bulk_load_transactions
+    @file_path NVARCHAR(500),
+    @batch_id BIGINT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    -- Set optimal settings for bulk operations
+    ALTER DATABASE SCOPED CONFIGURATION SET MAXDOP = 8;
+    
+    -- Use external table for high-performance loading
+    CREATE EXTERNAL TABLE ext_transactions_staging (
+        transaction_id BIGINT,
+        customer_id BIGINT,
+        product_id BIGINT,
+        transaction_date DATETIME2,
+        amount DECIMAL(18,2),
+        quantity INT,
+        discount_amount DECIMAL(18,2),
+        tax_amount DECIMAL(18,2),
+        payment_method NVARCHAR(50),
+        transaction_status NVARCHAR(20),
+        sales_rep_id BIGINT,
+        store_id BIGINT
+    )
+    WITH (
+        LOCATION = @file_path,
+        DATA_SOURCE = staging_blob_storage,
+        FILE_FORMAT = csv_format
+    );
+    
+    -- High-performance insert with columnstore optimization
+    INSERT INTO staging.transactions_raw WITH (TABLOCK)
+    SELECT 
+        *,
+        'EXT_SYSTEM' as source_system,
+        GETUTCDATE() as load_timestamp,
+        @batch_id as batch_id
+    FROM ext_transactions_staging;
+    
+    -- Drop external table
+    DROP EXTERNAL TABLE ext_transactions_staging;
+    
+    -- Update statistics for query optimization
+    UPDATE STATISTICS staging.transactions_raw;
+    
+END;
+
+-- =============================================================================
+-- 5. MEDALLION ARCHITECTURE SPECIFIC OPTIMIZATIONS
+-- =============================================================================
+
+-- Delta Lake / Databricks optimized patterns
+
+
+-- Bronze layer - Raw data with schema evolution
+/*
+CREATE TABLE bronze.transactions_delta (
+    transaction_id BIGINT,
+    customer_id BIGINT,
+    product_id BIGINT,
+    transaction_date TIMESTAMP,
+    amount DECIMAL(18,2),
+    -- Schema evolution friendly
+    additional_data MAP<STRING, STRING>,
+    -- Audit columns
+    _source_file STRING,
+    _ingestion_timestamp TIMESTAMP,
+    _batch_id BIGINT
+)
+USING DELTA
+PARTITIONED BY (DATE(_ingestion_timestamp))
+TBLPROPERTIES (
+    'delta.autoOptimize.optimizeWrite' = 'true',
+    'delta.autoOptimize.autoCompact' = 'true'
+);
+*/
+
+-- =============================================================================
+-- 6. BI-READY VIEWS AND MATERIALIZED VIEWS
+-- =============================================================================
+
+-- Customer 360 view for BI tools
+CREATE VIEW gold.vw_customer_360 AS
+SELECT 
+    c.customer_key,
+    c.customer_id,
+    c.customer_name,
+    c.email,
+    c.city,
+    c.state,
+    c.country,
+    c.customer_tier,
+    -- Analytics from aggregated table
+    ca.total_spend,
+    ca.total_transactions,
+    ca.avg_transaction_value,
+    ca.days_since_last_transaction,
+    ca.customer_segment,
+    ca.lifetime_value_tier,
+    ca.churn_risk_score,
+    ca.ytd_spend,
+    ca.ytd_transactions
+FROM silver.dim_customer c
+LEFT JOIN gold.customer_analytics ca ON c.customer_key = ca.customer_key
+WHERE c.is_current = 1;
+
+-- Sales dashboard view
+CREATE VIEW gold.vw_sales_dashboard AS
+SELECT 
+    ms.year_month,
+    ms.year_num,
+    ms.month_name,
+    ms.total_revenue,
+    ms.total_transactions,
+    ms.unique_customers,
+    ms.avg_transaction_value,
+    -- Calculate running totals for trend analysis
+    SUM(ms.total_revenue) OVER (
+        ORDER BY ms.year_month 
+        ROWS BETWEEN 11 PRECEDING AND CURRENT ROW
+    ) as trailing_12m_revenue,
+    -- Year over year comparison
+    LAG(ms.total_revenue, 12) OVER (ORDER BY ms.year_month) as same_month_last_year,
+    ms.revenue_growth_pct,
+    ms.top_category,
+    ms.top_product
+FROM gold.monthly_sales_summary ms;
+
+-- =============================================================================
+-- 7. AUTOMATED JOB ORCHESTRATION
+-- =============================================================================
+
+-- Master ETL procedure
+CREATE OR REPLACE PROCEDURE gold.usp_master_etl_pipeline
+    @batch_id BIGINT = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    -- Generate batch ID if not provided
+    IF @batch_id IS NULL
+        SET @batch_id = CAST(FORMAT(GETUTCDATE(), 'yyyyMMddHHmmss') AS BIGINT);
+    
+    BEGIN TRY
+        -- Log start
+        PRINT 'Starting ETL Pipeline - Batch ID: ' + CAST(@batch_id AS NVARCHAR(20));
+        
+        -- Step 1: Load staging data (assumes external process)
+        PRINT 'Step 1: Staging data load completed externally';
+        
+        -- Step 2: Silver layer transformations
+        PRINT 'Step 2: Loading Silver layer';
+        EXEC silver.usp_load_customer_dimension @batch_id;
+        EXEC silver.usp_load_product_dimension @batch_id;
+        EXEC silver.usp_load_fact_transactions @batch_id;
+        
+        -- Step 3: Gold layer aggregations
+        PRINT 'Step 3: Loading Gold layer';
+        EXEC gold.usp_refresh_customer_analytics;
+        EXEC gold.usp_refresh_monthly_summary;
+        
+        -- Step 4: Update statistics and maintenance
+        PRINT 'Step 4: Maintenance tasks';
+        EXEC gold.usp_update_statistics;
+        
+        PRINT 'ETL Pipeline completed successfully';
+        
+    END TRY
+    BEGIN CATCH
+        PRINT 'ETL Pipeline failed: ' + ERROR_MESSAGE();
+        THROW;
+    END CATCH;
+END;
+
+-- =============================================================================
+-- 8. MONITORING AND PERFORMANCE VIEWS
+-- =============================================================================
+
+-- Data quality monitoring view
+CREATE VIEW monitoring.vw_data_quality AS
+SELECT 
+    'customers_raw' as table_name,
+    COUNT(*) as total_records,
+    COUNT(customer_id) as non_null_keys,
+    COUNT(*) - COUNT(email) as missing_emails,
+    COUNT(CASE WHEN email NOT LIKE '%@%' THEN 1 END) as invalid_emails,
+    MAX(load_timestamp) as last_loaded
+FROM staging.customers_raw
+UNION ALL
+SELECT 
+    'transactions_raw' as table_name,
+    COUNT(*) as total_records,
+    COUNT(transaction_id) as non_null_keys,
+    COUNT(*) - COUNT(amount) as missing_amounts,
+    COUNT(CASE WHEN amount <= 0 THEN 1 END) as invalid_amounts,
+    MAX(load_timestamp) as last_loaded
+FROM staging.transactions_raw;
+
+-- Performance monitoring
+CREATE VIEW monitoring.vw_pipeline_performance AS
+SELECT 
+    table_name,
+    partition_number,
+    row_count,
+    reserved_space_kb,
+    used_space_kb,
+    compression_ratio
+FROM sys.dm_pdw_nodes_db_partition_stats s
+JOIN sys.objects o ON s.object_id = o.object_id
+WHERE o.schema_id IN (
+    SCHEMA_ID('staging'),
+    SCHEMA_ID('silver'), 
+    SCHEMA_ID('gold')
+);
+
