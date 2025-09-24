@@ -6,6 +6,7 @@ the full project will begin with pjt-* where * is the name of the project
 as of right now there are:
 
 -1 Full project This is  be a modern data platform project that demonstrates real-world enterprise-level capabilities in SQL, python , bug data, etl/elt , streaming, data quality and data governance
-Project name is Master_1
+Project name is modern-data-platform.git
+
 
 -One full code Cloud DWH Load code, in a single file. ETL Cloud DWH is the name
