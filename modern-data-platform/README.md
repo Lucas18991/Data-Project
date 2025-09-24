@@ -1,6 +1,6 @@
 A comprehensive modern data platform demonstrating advanced data engineering concepts including real-time streaming, big data processing, data governance, 
 and enterprise-grade data quality frameworks. This project showcases production-ready solutions.
-🏗️ Project Architecture
+Project Architecture
 ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────────┐
 │   Data Sources  │    │  Streaming Layer │    │   Processing Layer  │
 │                 │    │                  │    │                     │
@@ -28,7 +28,7 @@ and enterprise-grade data quality frameworks. This project showcases production-
 │ • SLA Monitoring│    │ • Quality Rules  │
 │ • Error Handling│    │ • Alerting       │
 └─────────────────┘    └──────────────────┘
-🎯 Key Features Demonstrated
+Key Features 
 Data Engineering Excellence
 
 Complex ETL/ELT Pipelines: Multi-stage data transformations with error handling and recovery
@@ -50,7 +50,7 @@ Recursive CTEs: Hierarchical data processing and graph traversal
 Performance Optimization: Query optimization with proper indexing strategies
 Advanced Aggregations: Statistical functions and time-series analysis
 
-📁 Project Structure
+Project Structure
 modern-data-platform/
 ├── README.md
 ├── docker-compose.yml
@@ -290,7 +290,6 @@ Accuracy: 99.8% accuracy validated through business rules
 Timeliness: 95% of data delivered within SLA windows
 Consistency: Cross-platform data consistency validation
 
-🔍 Complex Use Cases Implemented
 1. Real-time Fraud Detection
 
 Stream processing with 50ms latency requirements
